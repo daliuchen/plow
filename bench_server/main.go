@@ -1,30 +1,33 @@
 package main
 
 import (
-	"flag"
-	"log"
-	"math/rand"
-	"strconv"
-	"time"
-
-	"github.com/valyala/fasthttp"
+	"fmt"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"net/http"
 )
 
-var serverPort = flag.Int("p", 8080, "port to use for benchmarks")
-
 func main() {
-	flag.Parse()
-	rand.Seed(time.Now().UnixNano())
-	addr := "localhost:" + strconv.Itoa(*serverPort)
-	log.Println("Starting HTTP server on:", addr)
-	log.Fatalln(fasthttp.ListenAndServe(addr, func(c *fasthttp.RequestCtx) {
-		//time.Sleep(time.Duration(rand.Int63n(int64(5 * time.Second))))
-		if rand.Intn(5) == 0 {
-			c.SetStatusCode(400)
-		}
-		_, werr := c.Write(c.Request.Body())
-		if werr != nil {
-			log.Println(werr)
-		}
-	}))
+	// Echo instance
+	e := echo.New()
+
+	// Middleware
+	e.Use(middleware.Logger())
+	e.Use(middleware.Recover())
+
+	// Routes
+	e.GET("/", hello)
+	e.GET("/pt/:token", func(c echo.Context) error {
+		token := c.Param("token")
+		queryString := c.QueryString()
+		return c.String(http.StatusOK, fmt.Sprintf("token:%s,query:%s", token, queryString))
+	})
+
+	// Start server
+	e.Logger.Fatal(e.Start(":1323"))
+}
+
+// Handler
+func hello(c echo.Context) error {
+	return c.String(http.StatusOK, "Hello, World!")
 }

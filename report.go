@@ -145,10 +145,10 @@ func (s *StreamReport) Collect(records <-chan *ReportRecord) {
 		latencyWithinSecTemp.Update(float64(r.cost))
 		s.insert(float64(r.cost))
 		if r.code != "" {
-			s.codes[r.code] ++
+			s.codes[r.code]++
 		}
 		if r.error != "" {
-			s.errors[r.error] ++
+			s.errors[r.error]++
 		}
 		s.readBytes = r.readBytes
 		s.writeBytes = r.writeBytes

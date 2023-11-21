@@ -32,6 +32,7 @@ var (
 	apiPath         = "/data/"
 	latencyView     = "latency"
 	rpsView         = "rps"
+	codeView        = "code"
 	timeFormat      = "15:04:05"
 	refreshInterval = time.Second
 )
