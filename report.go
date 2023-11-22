@@ -263,6 +263,7 @@ func (s *StreamReport) Done() <-chan struct{} {
 type ChartsReport struct {
 	RPS     float64
 	Latency Stats
+	CodeMap map[string]int64
 }
 
 func (s *StreamReport) Charts() *ChartsReport {
@@ -274,6 +275,7 @@ func (s *StreamReport) Charts() *ChartsReport {
 		cr = &ChartsReport{
 			RPS:     s.rpsWithinSec,
 			Latency: *s.latencyWithinSec,
+			CodeMap: s.codes,
 		}
 	}
 	s.lock.Unlock()

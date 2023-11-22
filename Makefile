@@ -21,7 +21,7 @@ test:
 tidy:
 	$(GOTIDY)
 
-fmt:
+lint:
 	$(GOFMT) ./...
 
 clean:

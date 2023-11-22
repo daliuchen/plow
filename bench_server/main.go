@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"math/rand"
 	"net/http"
 )
 
@@ -20,7 +21,21 @@ func main() {
 	e.GET("/pt/:token", func(c echo.Context) error {
 		token := c.Param("token")
 		queryString := c.QueryString()
-		return c.String(http.StatusOK, fmt.Sprintf("token:%s,query:%s", token, queryString))
+		codes := []int{
+			http.StatusOK,
+			http.StatusOK,
+			http.StatusOK,
+			http.StatusOK,
+			http.StatusOK,
+			http.StatusAccepted,
+			http.StatusAlreadyReported,
+			http.StatusBadRequest,
+			http.StatusBadGateway,
+			http.StatusContinue,
+		}
+		intn := rand.Intn(len(codes))
+		return c.String(codes[intn], fmt.Sprintf("token:%s,query:%s", token, queryString))
+
 	})
 
 	// Start server
