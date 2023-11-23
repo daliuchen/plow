@@ -50,6 +50,8 @@ var (
 	summary         = kingpin.Flag("summary", "Only print the summary without realtime reports").Default("false").Bool()
 	pprofAddr       = kingpin.Flag("pprof", "Enable pprof at special address").Hidden().String()
 	url             = kingpin.Arg("url", "Request url").Required().String()
+	useRandomQuery  = kingpin.Flag("use-random-query", "use random query").Default("false").Bool()
+	pathParams      = kingpin.Flag("path-params", "path params").PlaceHolder("K:V").Strings()
 )
 
 // dynamically set by GoReleaser
@@ -246,6 +248,9 @@ func main() {
 		socks5Proxy: *socks5,
 		contentType: *contentType,
 		host:        *host,
+
+		useRandomQuery: *useRandomQuery,
+		pathParams:     *pathParams,
 	}
 
 	requester, err := NewRequester(*concurrency, *requests, *duration, reqRate.Limit(), &clientOpt)
@@ -287,6 +292,7 @@ func main() {
 
 	if ln != nil {
 		// serve charts data
+		// report.Charts mean is only pass charts function,
 		charts, err := NewCharts(ln, report.Charts, desc)
 		if err != nil {
 			errAndExit(err.Error())

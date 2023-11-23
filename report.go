@@ -145,10 +145,10 @@ func (s *StreamReport) Collect(records <-chan *ReportRecord) {
 		latencyWithinSecTemp.Update(float64(r.cost))
 		s.insert(float64(r.cost))
 		if r.code != "" {
-			s.codes[r.code] ++
+			s.codes[r.code]++
 		}
 		if r.error != "" {
-			s.errors[r.error] ++
+			s.errors[r.error]++
 		}
 		s.readBytes = r.readBytes
 		s.writeBytes = r.writeBytes
@@ -263,6 +263,7 @@ func (s *StreamReport) Done() <-chan struct{} {
 type ChartsReport struct {
 	RPS     float64
 	Latency Stats
+	CodeMap map[string]int64
 }
 
 func (s *StreamReport) Charts() *ChartsReport {
@@ -274,6 +275,7 @@ func (s *StreamReport) Charts() *ChartsReport {
 		cr = &ChartsReport{
 			RPS:     s.rpsWithinSec,
 			Latency: *s.latencyWithinSec,
+			CodeMap: s.codes,
 		}
 	}
 	s.lock.Unlock()

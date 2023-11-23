@@ -9,6 +9,7 @@ import (
 	"go.uber.org/automaxprocs/maxprocs"
 	"golang.org/x/time/rate"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	url2 "net/url"
 	"os"
@@ -20,6 +21,8 @@ import (
 	"syscall"
 	"time"
 )
+
+const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 var (
 	startTime        = time.Now()
@@ -106,6 +109,44 @@ type Requester struct {
 	writeBytes int64
 
 	cancel func()
+
+	requestUrlBuilder *requestUrlBuilder
+}
+
+type requestUrlBuilder struct {
+	originalURL    *url2.URL
+	useRandomQuery bool
+	pathParams     map[string][]string
+}
+
+func (r *requestUrlBuilder) Uri(uri *fasthttp.URI) {
+	path := r.originalURL.Path
+	uri.SetQueryString(r.originalURL.RawQuery)
+	if r.useRandomQuery {
+		k, v := r.randomQuery()
+		uri.QueryArgs().Set(k, v)
+	}
+	if len(r.pathParams) != 0 {
+		var pickParams []string
+		for k, v := range r.pathParams {
+			pickParams = append(pickParams, fmt.Sprintf(":%s", k))
+			pickParams = append(pickParams, v[rand.Intn(len(v))])
+		}
+		replacer := strings.NewReplacer(pickParams...)
+		path = replacer.Replace(path)
+	}
+	uri.SetPath(path)
+}
+
+func (r *requestUrlBuilder) randomQuery() (string, string) {
+	rand.NewSource(time.Now().UnixNano())
+
+	// todo@liuchen 池化
+	b := make([]byte, 6)
+	for i := range b {
+		b[i] = letterBytes[rand.Intn(len(letterBytes))]
+	}
+	return string(b[0:3]), string(b[3:6])
 }
 
 type ClientOpt struct {
@@ -128,6 +169,9 @@ type ClientOpt struct {
 	socks5Proxy string
 	contentType string
 	host        string
+
+	useRandomQuery bool
+	pathParams     []string
 }
 
 func NewRequester(concurrency int, requests int64, duration time.Duration, reqRate *rate.Limit, clientOpt *ClientOpt) (*Requester, error) {
@@ -149,6 +193,12 @@ func NewRequester(concurrency int, requests int64, duration time.Duration, reqRa
 	}
 	r.httpClient = client
 	r.httpHeader = header
+
+	builder, err := newRequestUrlBuilder(clientOpt)
+	if err != nil {
+		return nil, err
+	}
+	r.requestUrlBuilder = builder
 	return r, nil
 }
 
@@ -231,6 +281,86 @@ func buildRequestClient(opt *ClientOpt, r *int64, w *int64) (*fasthttp.HostClien
 	return httpClient, &requestHeader, nil
 }
 
+func newRequestUrlBuilder(opt *ClientOpt) (*requestUrlBuilder, error) {
+	var pathParamResult = make(map[string][]string)
+	url, _ := url2.Parse(opt.url)
+
+	for _, param := range opt.pathParams {
+		splits := strings.SplitN(param, ":", 2)
+		if len(splits) != 2 {
+			return nil, fmt.Errorf("invalid path param: %s", param)
+		}
+		k := splits[0]
+		tempV := strings.TrimSpace(splits[1])
+
+		if _, ok := pathParamResult[k]; ok {
+			return nil, fmt.Errorf("invalid path param: %s, key repeat", k)
+		}
+		if len(tempV) == 0 {
+			return nil, fmt.Errorf("invalid path param: %s", param)
+		}
+
+		var startCount, endCount int
+		for _, item := range tempV {
+			if item == '[' {
+				startCount++
+			} else if item == ']' {
+				endCount++
+			}
+		}
+
+		if startCount != endCount || startCount > 1 {
+			return nil, fmt.Errorf("invalid path param: %s", param)
+		}
+
+		if startCount == 0 {
+			pathParamResult[k] = []string{tempV}
+			continue
+		}
+
+		tempV = strings.ReplaceAll(tempV, "[", "")
+		tempV = strings.ReplaceAll(tempV, "]", "")
+		vs := strings.Split(tempV, ",")
+		pathParamResult[k] = vs
+	}
+
+	if len(pathParamResult) != 0 {
+		path := url.Path
+		split := strings.Split(path, "/")
+
+		var varSlice []string
+		for _, s := range split {
+			if len(s) == 0 {
+				continue
+			}
+			runes := []rune(s)
+			if runes[0] != ':' {
+				continue
+			}
+			if len(runes) == 1 {
+				println("error")
+			}
+			varStr := string(runes[1:])
+			varSlice = append(varSlice, varStr)
+		}
+		if len(varSlice) != len(pathParamResult) {
+			return nil, fmt.Errorf("url and path param not mathch,url:%s", opt.url)
+		}
+
+		for _, varStr := range varSlice {
+			if _, ok := pathParamResult[varStr]; !ok {
+				return nil, fmt.Errorf("url and path param not mathch,url:%s", opt.url)
+			}
+		}
+	}
+
+	return &requestUrlBuilder{
+		originalURL:    url,
+		useRandomQuery: opt.useRandomQuery,
+		pathParams:     pathParamResult,
+	}, nil
+}
+
 func (r *Requester) Cancel() {
 	r.cancel()
 }
@@ -253,7 +383,6 @@ func (r *Requester) DoRequest(req *fasthttp.Request, resp *fasthttp.Response, rr
 	} else {
 		err = r.httpClient.Do(req, resp)
 	}
-	var code string
 
 	if err != nil {
 		rr.cost = time.Since(startTime) - t1
@@ -261,18 +390,7 @@ func (r *Requester) DoRequest(req *fasthttp.Request, resp *fasthttp.Response, rr
 		rr.error = err.Error()
 		return
 	}
-	switch resp.StatusCode() / 100 {
-	case 1:
-		code = "1xx"
-	case 2:
-		code = "2xx"
-	case 3:
-		code = "3xx"
-	case 4:
-		code = "4xx"
-	case 5:
-		code = "5xx"
-	}
+
 	err = resp.BodyWriteTo(ioutil.Discard)
 	if err != nil {
 		rr.cost = time.Since(startTime) - t1
@@ -282,7 +400,7 @@ func (r *Requester) DoRequest(req *fasthttp.Request, resp *fasthttp.Response, rr
 	}
 
 	rr.cost = time.Since(startTime) - t1
-	rr.code = code
+	rr.code = strconv.Itoa(resp.StatusCode())
 	rr.error = ""
 }
 
@@ -332,6 +450,9 @@ func (r *Requester) Run() {
 			}
 
 			for {
+
+				r.requestUrlBuilder.Uri(req.URI())
+
 				select {
 				case <-ctx.Done():
 					return
