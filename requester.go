@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttpproxy"
@@ -31,7 +32,7 @@ var (
 
 type ReportRecord struct {
 	cost       time.Duration
-	code       string
+	code       int
 	error      string
 	readBytes  int64
 	writeBytes int64
@@ -338,7 +339,7 @@ func newRequestUrlBuilder(opt *ClientOpt) (*requestUrlBuilder, error) {
 				continue
 			}
 			if len(runes) == 1 {
-				println("error")
+				return nil, errors.New("invalid path params")
 			}
 			varStr := string(runes[1:])
 			varSlice = append(varSlice, varStr)
@@ -386,7 +387,6 @@ func (r *Requester) DoRequest(req *fasthttp.Request, resp *fasthttp.Response, rr
 
 	if err != nil {
 		rr.cost = time.Since(startTime) - t1
-		rr.code = ""
 		rr.error = err.Error()
 		return
 	}
@@ -394,13 +394,12 @@ func (r *Requester) DoRequest(req *fasthttp.Request, resp *fasthttp.Response, rr
 	err = resp.BodyWriteTo(ioutil.Discard)
 	if err != nil {
 		rr.cost = time.Since(startTime) - t1
-		rr.code = ""
 		rr.error = err.Error()
 		return
 	}
 
 	rr.cost = time.Since(startTime) - t1
-	rr.code = strconv.Itoa(resp.StatusCode())
+	rr.code = resp.StatusCode()
 	rr.error = ""
 }
 
