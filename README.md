@@ -133,6 +133,7 @@ Flags:
       --output-errors=OUTPUT-ERRORS  
                                  Output errors to file
       --summary                  Only print the summary without realtime reports
+      --breakdown                Split the latency of each request into connect, tls, write, wait and read phases
       --unix-socket=UNIX-SOCKET  Unix domain socket path to use for connection
       --version                  Show application version.
 
@@ -155,6 +156,47 @@ POST a json file:
 ```bash
 plow https://httpbin.org/post -c 20 --body @file.json -T 'application/json' -m POST
 ```
+
+### Latency Breakdown
+
+A single latency number cannot tell a slow server apart from a slow connection. `--breakdown` splits every request into
+the phases it actually went through, so a P99 spike can be traced to the phase that caused it:
+
+```bash
+plow http://127.0.0.1:8080/api -c 20 -d 5s --breakdown
+```
+
+```text
+Latency Breakdown  Count    Mean      P50      P90      P99      Max
+  Connect            20    1.428ms  1.652ms  1.842ms  1.848ms  1.848ms
+  Write            167875   18µs     17µs     25µs     39µs    1.32ms
+  Wait             167875   552µs    543µs    628µs    762µs   3.622ms
+  Read             167875   21µs     16µs     39µs     81µs    1.975ms
+  Overhead         167875    1µs      1µs      2µs      6µs    2.89ms
+```
+
+| Phase      | What it measures                                                                              |
+|------------|-----------------------------------------------------------------------------------------------|
+| `Connect`  | Dialing the address: DNS resolution and the TCP handshake (or the proxy / unix socket connect) |
+| `TLS`      | The TLS handshake, only shown for `https` targets                                              |
+| `Write`    | Writing the request onto the socket                                                            |
+| `Wait`     | Time to first response byte, i.e. the server thinking                                          |
+| `Read`     | Receiving the rest of the response, i.e. transferring the body                                 |
+| `Overhead` | Whatever the measured latency has left: connection pool, response parsing, client scheduling   |
+
+`Connect` and `TLS` only happen when a request has to open a connection, so their `Count` is the number of connections
+opened, not the number of requests - the example above shows 20 connections serving 167875 requests. A `Count` that
+keeps climbing during a run means connections are being re-established, and a `TLS` line with a high `P99` explains
+overall latency spikes that have nothing to do with the server. A `Read` far above `Wait` means the response body, not
+the server, dominates the measurement. The breakdown is also plotted over time in the Web UI, and included in `--json`
+output.
+
+Notes:
+
+* Phases are only recorded for requests that completed, so failed requests do not distort them.
+* `Read` is `0` when the whole response arrives in a single read, which is the normal case for small responses.
+* The breakdown gives each connection to a single worker so that connection level timings can be attributed to the
+  request that caused them. Total connections are still `-c`, but they are no longer pooled across workers.
 
 ### Bash/ZSH Shell Completion
 

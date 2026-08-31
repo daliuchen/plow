@@ -138,3 +138,63 @@ func TestAlignBulkPadsColumns(t *testing.T) {
 		t.Fatalf("second column = %q, want right aligned", bulk[0][1])
 	}
 }
+
+func testBreakdownSnapshotReport() *SnapshotReport {
+	report := testSnapshotReport()
+	report.Breakdown = []*PhaseReport{
+		{
+			Name: "Connect", Count: 2, Mean: 3 * time.Millisecond, Max: 4 * time.Millisecond,
+			Percentiles: []time.Duration{3 * time.Millisecond, 4 * time.Millisecond, 4 * time.Millisecond},
+		},
+		{
+			Name: "Wait", Count: 3, Mean: 12 * time.Millisecond, Max: 19 * time.Millisecond,
+			Percentiles: []time.Duration{11 * time.Millisecond, 18 * time.Millisecond, 19 * time.Millisecond},
+		},
+	}
+	return report
+}
+
+func TestPrinterFormatTableReportsIncludesBreakdown(t *testing.T) {
+	printer := NewPrinter(3, 0, false, false)
+
+	var without bytes.Buffer
+	printer.formatTableReports(&without, testSnapshotReport(), true, false)
+	if strings.Contains(without.String(), "Latency Breakdown") {
+		t.Fatalf("breakdown table rendered without --breakdown:\n%s", without.String())
+	}
+
+	var with bytes.Buffer
+	printer.formatTableReports(&with, testBreakdownSnapshotReport(), true, false)
+	out := with.String()
+	for _, want := range []string{"Latency Breakdown", "Connect", "Wait", "P50", "P90", "P99"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("breakdown table is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestPrinterFormatJSONReportsIncludesBreakdown(t *testing.T) {
+	printer := NewPrinter(3, 0, false, false)
+	var buf bytes.Buffer
+	printer.formatJSONReports(&buf, testBreakdownSnapshotReport(), true, false)
+
+	var got struct {
+		Breakdown map[string]struct {
+			Count int64  `json:"Count"`
+			Mean  string `json:"Mean"`
+			P50   string `json:"P50"`
+			P99   string `json:"P99"`
+			Max   string `json:"Max"`
+		} `json:"Breakdown"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, buf.String())
+	}
+	wait, ok := got.Breakdown["Wait"]
+	if !ok {
+		t.Fatalf("Breakdown is missing the Wait phase: %s", buf.String())
+	}
+	if wait.Count != 3 || wait.Mean != "12ms" || wait.P50 != "11ms" || wait.P99 != "19ms" || wait.Max != "19ms" {
+		t.Fatalf("Wait = %+v, want the phase report verbatim", wait)
+	}
+}

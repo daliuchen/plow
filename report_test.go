@@ -43,7 +43,7 @@ func TestStreamReportCollectAndSnapshot(t *testing.T) {
 	t.Cleanup(func() { atomic.StoreInt64(&startTimeUnixNano, oldStartTime) })
 	atomic.StoreInt64(&startTimeUnixNano, time.Now().Add(-2*time.Second).UnixNano())
 
-	report := NewStreamReport()
+	report := NewStreamReport(false)
 	records := make(chan *ReportRecord, 3)
 	done := make(chan struct{})
 	go func() {
@@ -95,7 +95,7 @@ func TestStreamReportCollectAndSnapshot(t *testing.T) {
 }
 
 func TestStreamReportCharts(t *testing.T) {
-	report := NewStreamReport()
+	report := NewStreamReport(false)
 
 	report.lock.Lock()
 	report.latencyWithinSec.Update(float64(10 * time.Millisecond))
@@ -130,5 +130,91 @@ func TestStreamReportCharts(t *testing.T) {
 	report.lock.Unlock()
 	if got := report.Charts(); got != nil {
 		t.Fatalf("Charts() = %+v when noDateWithinSec is true, want nil", got)
+	}
+}
+
+func TestStreamReportBreakdown(t *testing.T) {
+	oldStartTime := atomic.LoadInt64(&startTimeUnixNano)
+	t.Cleanup(func() { atomic.StoreInt64(&startTimeUnixNano, oldStartTime) })
+	atomic.StoreInt64(&startTimeUnixNano, time.Now().Add(-time.Second).UnixNano())
+
+	report := NewStreamReport(true)
+	records := make(chan *ReportRecord, 3)
+	done := make(chan struct{})
+	go func() {
+		report.Collect(records)
+		close(done)
+	}()
+
+	dialed := &ReportRecord{cost: 30 * time.Millisecond, code: 200, hasPhases: true, dialed: true}
+	dialed.phases[phaseConnect] = 4 * time.Millisecond
+	dialed.phases[phaseTLS] = 6 * time.Millisecond
+	dialed.phases[phaseWrite] = time.Millisecond
+	dialed.phases[phaseWait] = 15 * time.Millisecond
+	dialed.phases[phaseRead] = 2 * time.Millisecond
+	dialed.phases[phaseOverhead] = 2 * time.Millisecond
+
+	reused := &ReportRecord{cost: 20 * time.Millisecond, code: 200, hasPhases: true}
+	reused.phases[phaseWrite] = time.Millisecond
+	reused.phases[phaseWait] = 17 * time.Millisecond
+	reused.phases[phaseRead] = time.Millisecond
+	reused.phases[phaseOverhead] = time.Millisecond
+
+	records <- dialed
+	records <- reused
+	// A failed request carries no breakdown and must not be sampled.
+	records <- &ReportRecord{cost: 5 * time.Millisecond, error: "connection reset by peer"}
+	close(records)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Collect did not stop after records channel was closed")
+	}
+
+	snapshot := report.Snapshot()
+	byName := make(map[string]*PhaseReport, len(snapshot.Breakdown))
+	for _, phase := range snapshot.Breakdown {
+		byName[phase.Name] = phase
+	}
+	if len(byName) != phaseCount {
+		t.Fatalf("Breakdown has %d phases (%v), want %d", len(byName), byName, phaseCount)
+	}
+
+	// Connection level phases are only sampled on the request that dialed.
+	if got := byName["Connect"]; got.Count != 1 || got.Mean != 4*time.Millisecond {
+		t.Fatalf("Connect = %+v, want a single 4ms sample", got)
+	}
+	if got := byName["TLS"]; got.Count != 1 || got.Mean != 6*time.Millisecond {
+		t.Fatalf("TLS = %+v, want a single 6ms sample", got)
+	}
+	if got := byName["Wait"]; got.Count != 2 || got.Mean != 16*time.Millisecond || got.Max != 17*time.Millisecond {
+		t.Fatalf("Wait = %+v, want two samples averaging 16ms with a 17ms max", got)
+	}
+	if got := len(byName["Wait"].Percentiles); got != len(phaseQuantiles) {
+		t.Fatalf("Wait percentiles = %d, want %d", got, len(phaseQuantiles))
+	}
+}
+
+func TestStreamReportBreakdownSkippedWhenDisabled(t *testing.T) {
+	report := NewStreamReport(false)
+	records := make(chan *ReportRecord, 1)
+	done := make(chan struct{})
+	go func() {
+		report.Collect(records)
+		close(done)
+	}()
+
+	rr := &ReportRecord{cost: 10 * time.Millisecond, code: 200, hasPhases: true, dialed: true}
+	rr.phases[phaseWait] = 9 * time.Millisecond
+	records <- rr
+	close(records)
+	<-done
+
+	if got := report.Snapshot().Breakdown; got != nil {
+		t.Fatalf("Breakdown = %+v, want nil without --breakdown", got)
+	}
+	if got := report.Charts().Breakdown; got != nil {
+		t.Fatalf("Charts().Breakdown = %+v, want nil without --breakdown", got)
 	}
 }

@@ -22,6 +22,17 @@ var quantilesTarget = map[float64]float64{
 	0.9999: 0.00001,
 }
 
+// Phase latencies are tracked with a coarser target set than the overall
+// latency: they exist to explain where the time goes, not to be reported at
+// four nines, and a tighter stream costs more per inserted sample.
+var phaseQuantiles = []float64{0.50, 0.90, 0.99}
+
+var phaseQuantilesTarget = map[float64]float64{
+	0.50: 0.01,
+	0.90: 0.001,
+	0.99: 0.001,
+}
+
 var httpStatusSectionLabelMap = map[int]string{
 	1: "1xx",
 	2: "2xx",
@@ -74,9 +85,23 @@ func (s *Stats) Reset() {
 	s.max = 0
 }
 
+// phaseAgg accumulates the samples of a single latency phase.
+type phaseAgg struct {
+	stats    Stats
+	quantile *quantile.Stream
+}
+
+func (p *phaseAgg) insert(v float64) {
+	p.stats.Update(v)
+	p.quantile.Insert(v)
+}
+
 type StreamReport struct {
 	lock sync.Mutex
 
+	// breakdown is nil unless --breakdown is enabled.
+	breakdown        []*phaseAgg
+	phaseWithinSec   [phaseCount]Stats
 	latencyStats     *Stats
 	rpsStats         *Stats
 	latencyQuantile  *quantile.Stream
@@ -95,8 +120,16 @@ type StreamReport struct {
 	doneChan chan struct{}
 }
 
-func NewStreamReport() *StreamReport {
+func NewStreamReport(breakdown bool) *StreamReport {
+	var phases []*phaseAgg
+	if breakdown {
+		phases = make([]*phaseAgg, phaseCount)
+		for i := range phases {
+			phases[i] = &phaseAgg{quantile: quantile.NewTargeted(phaseQuantilesTarget)}
+		}
+	}
 	return &StreamReport{
+		breakdown:        phases,
 		latencyQuantile:  quantile.NewTargeted(quantilesTarget),
 		latencyHistogram: histogram.New(8),
 		codes:            make(map[int]int64, 1),
@@ -114,8 +147,22 @@ func (s *StreamReport) insert(v float64) {
 	s.latencyStats.Update(v)
 }
 
+// insertPhases records the latency breakdown of one request. Connection level
+// phases are only sampled for the request that actually opened the connection,
+// otherwise every keep-alive request would dilute them with zeros.
+func (s *StreamReport) insertPhases(r *ReportRecord, withinSec *[phaseCount]Stats) {
+	for i, d := range r.phases {
+		if (i == phaseConnect && !r.dialed) || (i == phaseTLS && (!r.dialed || d == 0)) {
+			continue
+		}
+		s.breakdown[i].insert(float64(d))
+		withinSec[i].Update(float64(d))
+	}
+}
+
 func (s *StreamReport) Collect(records <-chan *ReportRecord) {
 	latencyWithinSecTemp := &Stats{}
+	var phaseWithinSecTemp [phaseCount]Stats
 	go func() {
 		startTime := time.Unix(0, atomic.LoadInt64(&startTimeUnixNano))
 		ticker := time.NewTicker(time.Second)
@@ -135,6 +182,10 @@ func (s *StreamReport) Collect(records <-chan *ReportRecord) {
 					*s.latencyWithinSec = *latencyWithinSecTemp
 					s.rpsWithinSec = rps
 					latencyWithinSecTemp.Reset()
+					s.phaseWithinSec = phaseWithinSecTemp
+					for i := range phaseWithinSecTemp {
+						phaseWithinSecTemp[i].Reset()
+					}
 					s.noDateWithinSec = false
 				} else {
 					s.noDateWithinSec = true
@@ -155,6 +206,9 @@ func (s *StreamReport) Collect(records <-chan *ReportRecord) {
 		s.lock.Lock()
 		latencyWithinSecTemp.Update(float64(r.cost))
 		s.insert(float64(r.cost))
+		if r.hasPhases && s.breakdown != nil {
+			s.insertPhases(r, &phaseWithinSecTemp)
+		}
 		if r.code != 0 {
 			s.codes[r.code]++
 		}
@@ -209,6 +263,20 @@ type SnapshotReport struct {
 		Mean  time.Duration
 		Count int
 	}
+
+	// Breakdown is nil unless --breakdown is enabled.
+	Breakdown []*PhaseReport
+}
+
+// PhaseReport is the latency of one request phase. Count is the number of
+// samples, which for the connection level phases is the number of connections
+// opened rather than the number of requests.
+type PhaseReport struct {
+	Name        string
+	Count       int64
+	Mean        time.Duration
+	Max         time.Duration
+	Percentiles []time.Duration
 }
 
 func (s *StreamReport) Snapshot() *SnapshotReport {
@@ -262,6 +330,23 @@ func (s *StreamReport) Snapshot() *SnapshotReport {
 		}{p, time.Duration(s.latencyQuantile.Query(p))}
 	}
 
+	for i, phase := range s.breakdown {
+		if phase.stats.count == 0 {
+			continue
+		}
+		pr := &PhaseReport{
+			Name:        phaseNames[i],
+			Count:       phase.stats.count,
+			Mean:        time.Duration(phase.stats.Mean()),
+			Max:         time.Duration(phase.stats.max),
+			Percentiles: make([]time.Duration, len(phaseQuantiles)),
+		}
+		for j, q := range phaseQuantiles {
+			pr.Percentiles[j] = time.Duration(phase.quantile.Query(q))
+		}
+		rs.Breakdown = append(rs.Breakdown, pr)
+	}
+
 	hisBins := s.latencyHistogram.Bins()
 	rs.Histograms = make([]*struct {
 		Mean  time.Duration
@@ -287,7 +372,16 @@ type ChartsReport struct {
 	Latency     Stats
 	CodeMap     map[int]int64
 	Concurrency int
+	// Breakdown holds the mean of each per-request phase over the last second,
+	// nil unless --breakdown is enabled.
+	Breakdown []float64
 }
+
+// chartPhases are the phases plotted over time. The connection level phases are
+// left out on purpose: they only happen on a handful of requests, so a line
+// through them says more about when a connection was opened than about the
+// latency of the second it lands in.
+var chartPhases = []int{phaseWrite, phaseWait, phaseRead, phaseOverhead}
 
 func (s *StreamReport) Charts() *ChartsReport {
 	s.lock.Lock()
@@ -300,6 +394,12 @@ func (s *StreamReport) Charts() *ChartsReport {
 			Latency:     *s.latencyWithinSec,
 			CodeMap:     s.copyCodes(),
 			Concurrency: s.concurrencyCount,
+		}
+		if s.breakdown != nil {
+			cr.Breakdown = make([]float64, len(chartPhases))
+			for i, phase := range chartPhases {
+				cr.Breakdown[i] = s.phaseWithinSec[phase].Mean()
+			}
 		}
 	}
 	s.lock.Unlock()

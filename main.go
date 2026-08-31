@@ -52,6 +52,7 @@ var (
 	clean           = kingpin.Flag("clean", "Clean the histogram bar once its finished. Default is true").Default("true").NegatableBool()
 	outputErrors    = kingpin.Flag("output-errors", "Output errors to file").String()
 	summary         = kingpin.Flag("summary", "Only print the summary without realtime reports").Default("false").Bool()
+	breakdown       = kingpin.Flag("breakdown", "Split the latency of each request into connect, tls, write, wait and read phases").Default("false").Bool()
 	pprofAddr       = kingpin.Flag("pprof", "Enable pprof at special address").Hidden().String()
 	url             = kingpin.Arg("url", "Request url").Required().String()
 	unixSocket      = kingpin.Flag("unix-socket", "Unix domain socket path to use for connection").String()
@@ -262,6 +263,7 @@ func main() {
 		contentType: *contentType,
 		host:        *host,
 		unixSocket:  *unixSocket,
+		breakdown:   *breakdown,
 	}
 
 	requester, err := NewRequester(*concurrency, *requests, *duration, reqRate.Limit(), errWriter, &clientOpt, *rampUp)
@@ -301,12 +303,12 @@ func main() {
 	go requester.Run()
 
 	// metrics collection
-	report := NewStreamReport()
+	report := NewStreamReport(*breakdown)
 	go report.Collect(requester.RecordChan())
 
 	if ln != nil {
 		// serve charts data
-		charts, err := NewCharts(ln, report.Charts, desc)
+		charts, err := NewCharts(ln, report.Charts, desc, *breakdown)
 		if err != nil {
 			errAndExit(err.Error())
 			return
