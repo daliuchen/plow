@@ -236,13 +236,18 @@ func NewRequester(concurrency int, requests int64, duration time.Duration, reqRa
 			}
 			r.httpClients[i] = client
 			r.traces[i] = trace
-			r.httpHeader = header
+			// Same header for every worker, so keep one template.
+			if i == 0 {
+				r.httpHeader = header
+			}
 		}
 	} else {
 		client, header, err := buildRequestClient(clientOpt, &r.readBytes, &r.writeBytes)
 		if err != nil {
 			return nil, err
 		}
+		// Every worker shares one client, as before; the slice just keeps the
+		// lookup in the worker loop uniform.
 		for i := range r.httpClients {
 			r.httpClients[i] = client
 		}
