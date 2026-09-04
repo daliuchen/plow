@@ -35,6 +35,13 @@ type ReportRecord struct {
 	readBytes        int64
 	writeBytes       int64
 	concurrencyCount int
+
+	// Latency breakdown, only filled when --breakdown is enabled and the
+	// request succeeded. dialed reports whether this request had to open a new
+	// connection, which is what makes the Connect and TLS phases meaningful.
+	hasPhases bool
+	dialed    bool
+	phases    [phaseCount]time.Duration
 }
 
 var recordPool = sync.Pool{
@@ -57,10 +64,13 @@ func init() {
 type MyConn struct {
 	net.Conn
 	r, w *int64
+	// trace is nil unless the latency breakdown is enabled. It belongs to the
+	// single worker goroutine that dialed this connection.
+	trace *phaseTrace
 }
 
-func NewMyConn(conn net.Conn, r, w *int64) (*MyConn, error) {
-	myConn := &MyConn{Conn: conn, r: r, w: w}
+func NewMyConn(conn net.Conn, r, w *int64, trace *phaseTrace) (*MyConn, error) {
+	myConn := &MyConn{Conn: conn, r: r, w: w, trace: trace}
 	return myConn, nil
 }
 
@@ -69,26 +79,78 @@ func (c *MyConn) Read(b []byte) (n int, err error) {
 
 	if err == nil {
 		atomic.AddInt64(c.r, int64(sz))
+		if c.trace != nil {
+			c.trace.onRead(time.Now())
+		}
 	}
 	return sz, err
 }
 
 func (c *MyConn) Write(b []byte) (n int, err error) {
+	var start time.Time
+	if c.trace != nil {
+		start = time.Now()
+	}
 	sz, err := c.Conn.Write(b)
 
 	if err == nil {
 		atomic.AddInt64(c.w, int64(sz))
+		if c.trace != nil {
+			c.trace.onWrite(start, time.Now())
+		}
 	}
 	return sz, err
 }
 
-func ThroughputInterceptorDial(dial fasthttp.DialFunc, r *int64, w *int64) fasthttp.DialFunc {
+func ThroughputInterceptorDial(dial fasthttp.DialFunc, r *int64, w *int64, trace *phaseTrace) fasthttp.DialFunc {
+	return func(addr string) (net.Conn, error) {
+		start := time.Now()
+		conn, err := dial(addr)
+		if err != nil {
+			return nil, err
+		}
+		if trace != nil {
+			trace.onDial(time.Since(start))
+		}
+		return NewMyConn(conn, r, w, trace)
+	}
+}
+
+// TLSInterceptorDial performs the TLS handshake itself so it can be timed
+// separately from the dial and from the request.
+//
+// fasthttp normally handshakes right after calling the dial func, which would
+// leave the handshake bytes indistinguishable from the request bytes on the
+// traced connection. It skips its own handshake when the dial func returns a
+// connection that already exposes Handshake() error (see dialAddr in
+// fasthttp/client.go), which is exactly what *tls.Conn does, so returning one
+// here hands us the timing without changing what goes over the wire.
+func TLSInterceptorDial(dial fasthttp.DialFunc, tlsConfig *tls.Config, timeout time.Duration, trace *phaseTrace) fasthttp.DialFunc {
 	return func(addr string) (net.Conn, error) {
 		conn, err := dial(addr)
 		if err != nil {
 			return nil, err
 		}
-		return NewMyConn(conn, r, w)
+		start := time.Now()
+		tlsConn := tls.Client(conn, tlsConfig)
+		if timeout > 0 {
+			if err := tlsConn.SetDeadline(start.Add(timeout)); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+		}
+		if err := tlsConn.Handshake(); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		if timeout > 0 {
+			if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+		}
+		trace.onHandshake(time.Since(start))
+		return tlsConn, nil
 	}
 }
 
@@ -99,7 +161,13 @@ type Requester struct {
 	duration    time.Duration
 	rampUp      int
 	clientOpt   *ClientOpt
-	httpClient  *fasthttp.HostClient
+	// httpClients has one entry per worker. Without the latency breakdown every
+	// entry is the same shared client, so connection pooling is unchanged; with
+	// it each worker gets its own single-connection client so that connection
+	// level timings can be attributed to the request that caused them.
+	httpClients []*fasthttp.HostClient
+	traces      []*phaseTrace
+	isTLS       bool
 	httpHeader  *fasthttp.RequestHeader
 	errWriter   io.Writer
 
@@ -135,6 +203,8 @@ type ClientOpt struct {
 	contentType string
 	host        string
 	unixSocket  string
+
+	breakdown bool
 }
 
 func NewRequester(concurrency int, requests int64, duration time.Duration, reqRate *rate.Limit, errWriter io.Writer, clientOpt *ClientOpt, rampUp int) (*Requester, error) {
@@ -151,14 +221,54 @@ func NewRequester(concurrency int, requests int64, duration time.Duration, reqRa
 		errWriter:   errWriter,
 		clientOpt:   clientOpt,
 		recordChan:  make(chan *ReportRecord, maxResult),
+		httpClients: make([]*fasthttp.HostClient, concurrency),
 	}
-	client, header, err := buildRequestClient(clientOpt, &r.readBytes, &r.writeBytes)
-	if err != nil {
-		return nil, err
+	if clientOpt.breakdown {
+		// One dialer for all of them, so they still share a single DNS cache.
+		baseDial, err := buildBaseDialFunc(clientOpt)
+		if err != nil {
+			return nil, err
+		}
+		r.traces = make([]*phaseTrace, concurrency)
+		for i := 0; i < concurrency; i++ {
+			// Own client, own connection, own trace: see phaseTrace.
+			workerOpt := *clientOpt
+			workerOpt.maxConns = 1
+			trace := &phaseTrace{}
+			client, header, err := buildTracedRequestClient(&workerOpt, &r.readBytes, &r.writeBytes, trace, baseDial)
+			if err != nil {
+				return nil, err
+			}
+			r.httpClients[i] = client
+			r.traces[i] = trace
+			// Same header for every worker, so keep one template.
+			if i == 0 {
+				r.httpHeader = header
+			}
+		}
+	} else {
+		client, header, err := buildRequestClient(clientOpt, &r.readBytes, &r.writeBytes)
+		if err != nil {
+			return nil, err
+		}
+		// Every worker shares one client, as before; the slice just keeps the
+		// lookup in the worker loop uniform.
+		for i := range r.httpClients {
+			r.httpClients[i] = client
+		}
+		r.httpHeader = header
 	}
-	r.httpClient = client
-	r.httpHeader = header
+	if concurrency > 0 {
+		r.isTLS = r.httpClients[0].IsTLS
+	}
 	return r, nil
+}
+
+func (r *Requester) trace(idx int) *phaseTrace {
+	if r.traces == nil {
+		return nil
+	}
+	return r.traces[idx]
 }
 
 func addMissingPort(addr string, isTLS bool) string {
@@ -187,7 +297,54 @@ func buildTLSConfig(opt *ClientOpt) (*tls.Config, error) {
 	}, nil
 }
 
+// tlsServerName mirrors how fasthttp derives the SNI name from the address it
+// dials, so taking over the handshake does not change certificate validation.
+// A "*" means the address is not a usable server name.
+func tlsServerName(addr string) string {
+	if !strings.Contains(addr, ":") {
+		return addr
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "*"
+	}
+	return host
+}
+
+// buildBaseDialFunc builds the dial func for the configured transport. Dialing
+// holds no per-request state, so one is shared by every worker: a dialer of its
+// own per worker would also mean a DNS cache of its own per worker.
+func buildBaseDialFunc(opt *ClientOpt) (fasthttp.DialFunc, error) {
+	switch {
+	case opt.socks5Proxy != "":
+		proxy := opt.socks5Proxy
+		if !strings.Contains(proxy, "://") {
+			proxy = "socks5://" + proxy
+		}
+		return fasthttpproxy.FasthttpSocksDialer(proxy), nil
+	case opt.unixSocket != "":
+		return func(addr string) (net.Conn, error) {
+			return net.Dial("unix", opt.unixSocket)
+		}, nil
+	case opt.httpProxy != "":
+		return fasthttpproxy.FasthttpHTTPDialerDualStack(opt.httpProxy), nil
+	default:
+		dialer := fasthttpproxy.Dialer{
+			Timeout:        opt.dialTimeout,
+			ConnectTimeout: opt.dialTimeout,
+			DialDualStack:  true,
+		}
+		return dialer.GetDialFunc(true)
+	}
+}
+
 func buildRequestClient(opt *ClientOpt, r *int64, w *int64) (*fasthttp.HostClient, *fasthttp.RequestHeader, error) {
+	return buildTracedRequestClient(opt, r, w, nil, nil)
+}
+
+// A nil baseDial makes the client build its own; the workers of a traced run
+// pass a shared one in.
+func buildTracedRequestClient(opt *ClientOpt, r *int64, w *int64, trace *phaseTrace, baseDial fasthttp.DialFunc) (*fasthttp.HostClient, *fasthttp.RequestHeader, error) {
 	u, err := url2.Parse(opt.url)
 	if err != nil {
 		return nil, nil, err
@@ -201,35 +358,31 @@ func buildRequestClient(opt *ClientOpt, r *int64, w *int64) (*fasthttp.HostClien
 		WriteTimeout:                  opt.writeTimeout,
 		DisableHeaderNamesNormalizing: true,
 	}
-	if opt.socks5Proxy != "" {
-		if !strings.Contains(opt.socks5Proxy, "://") {
-			opt.socks5Proxy = "socks5://" + opt.socks5Proxy
-		}
-		httpClient.Dial = fasthttpproxy.FasthttpSocksDialer(opt.socks5Proxy)
-	} else if opt.unixSocket != "" {
-		httpClient.Dial = func(addr string) (net.Conn, error) {
-			return net.Dial("unix", opt.unixSocket)
-		}
-	} else if opt.httpProxy != "" {
-		httpClient.Dial = fasthttpproxy.FasthttpHTTPDialerDualStack(opt.httpProxy)
-	} else {
-		dialer := fasthttpproxy.Dialer{
-			Timeout:        opt.dialTimeout,
-			ConnectTimeout: opt.dialTimeout,
-			DialDualStack:  true,
-		}
-		httpClient.Dial, err = dialer.GetDialFunc(true)
+	if baseDial == nil {
+		baseDial, err = buildBaseDialFunc(opt)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
-	httpClient.Dial = ThroughputInterceptorDial(httpClient.Dial, r, w)
+	httpClient.Dial = ThroughputInterceptorDial(baseDial, r, w, trace)
 
 	tlsConfig, err := buildTLSConfig(opt)
 	if err != nil {
 		return nil, nil, err
 	}
 	httpClient.TLSConfig = tlsConfig
+
+	if trace != nil && httpClient.IsTLS {
+		handshakeConfig := tlsConfig.Clone()
+		if handshakeConfig.ServerName == "" {
+			if serverName := tlsServerName(httpClient.Addr); serverName == "*" {
+				handshakeConfig.InsecureSkipVerify = true
+			} else {
+				handshakeConfig.ServerName = serverName
+			}
+		}
+		httpClient.Dial = TLSInterceptorDial(httpClient.Dial, handshakeConfig, opt.dialTimeout, trace)
+	}
 
 	var requestHeader fasthttp.RequestHeader
 	if opt.contentType != "" {
@@ -267,14 +420,19 @@ func (r *Requester) closeRecord() {
 	})
 }
 
-func (r *Requester) DoRequest(req *fasthttp.Request, resp *fasthttp.Response, rr *ReportRecord) {
+func (r *Requester) DoRequest(client *fasthttp.HostClient, trace *phaseTrace, req *fasthttp.Request, resp *fasthttp.Response, rr *ReportRecord) {
 	startTime := time.Unix(0, atomic.LoadInt64(&startTimeUnixNano))
 	t1 := time.Since(startTime)
+	rr.hasPhases = false
+	rr.dialed = false
+	if trace != nil {
+		trace.reset()
+	}
 	var err error
 	if r.clientOpt.doTimeout > 0 {
-		err = r.httpClient.DoTimeout(req, resp, r.clientOpt.doTimeout)
+		err = client.DoTimeout(req, resp, r.clientOpt.doTimeout)
 	} else {
-		err = r.httpClient.Do(req, resp)
+		err = client.Do(req, resp)
 	}
 
 	if err != nil {
@@ -299,6 +457,9 @@ func (r *Requester) DoRequest(req *fasthttp.Request, resp *fasthttp.Response, rr
 	rr.cost = time.Since(startTime) - t1
 	rr.code = resp.StatusCode()
 	rr.error = ""
+	if trace != nil {
+		trace.fill(rr)
+	}
 }
 
 func (r *Requester) Run() {
@@ -348,6 +509,7 @@ func (r *Requester) Run() {
 				break
 			}
 			concurrencyCount++
+			workerIdx := concurrencyCount - 1
 			r.wg.Add(1)
 			go func() {
 				defer func() {
@@ -357,10 +519,12 @@ func (r *Requester) Run() {
 						panic(v)
 					}
 				}()
+				client := r.httpClients[workerIdx]
+				trace := r.trace(workerIdx)
 				req := &fasthttp.Request{}
 				resp := &fasthttp.Response{}
 				r.httpHeader.CopyTo(&req.Header)
-				if r.httpClient.IsTLS {
+				if r.isTLS {
 					req.URI().SetScheme("https")
 					req.URI().SetHostBytes(req.Header.Host())
 				}
@@ -390,6 +554,7 @@ func (r *Requester) Run() {
 							rr := recordPool.Get().(*ReportRecord)
 							rr.cost = 0
 							rr.error = err.Error()
+							rr.hasPhases = false
 							rr.readBytes = atomic.LoadInt64(&r.readBytes)
 							rr.writeBytes = atomic.LoadInt64(&r.writeBytes)
 							rr.concurrencyCount = concurrencyCount
@@ -402,7 +567,7 @@ func (r *Requester) Run() {
 					}
 					resp.Reset()
 					rr := recordPool.Get().(*ReportRecord)
-					r.DoRequest(req, resp, rr)
+					r.DoRequest(client, trace, req, resp, rr)
 					rr.readBytes = atomic.LoadInt64(&r.readBytes)
 					rr.writeBytes = atomic.LoadInt64(&r.writeBytes)
 					rr.concurrencyCount = concurrencyCount

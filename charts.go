@@ -34,6 +34,7 @@ var (
 	rpsView         = "rps"
 	codeView        = "code"
 	concurrencyView = "concurrency"
+	breakdownView   = "breakdown"
 	timeFormat      = "15:04:05"
 	refreshInterval = time.Second
 
@@ -42,6 +43,7 @@ var (
 		latencyView:     ViewTpl,
 		codeView:        CodeViewTpl,
 		concurrencyView: ViewTpl,
+		breakdownView:   ViewTpl,
 	}
 )
 
@@ -226,6 +228,19 @@ func (c *Charts) newConcurrencyView() components.Charter {
 	return graph
 }
 
+func (c *Charts) newBreakdownView() components.Charter {
+	graph := c.newBasicView(breakdownView)
+	graph.SetGlobalOptions(
+		charts.WithTitleOpts(opts.Title{Title: "Latency Breakdown"}),
+		charts.WithYAxisOpts(opts.YAxis{Scale: opts.Bool(true), AxisLabel: &opts.AxisLabel{Formatter: "{value} ms"}}),
+		charts.WithLegendOpts(opts.Legend{Show: opts.Bool(true)}),
+	)
+	for _, phase := range chartPhases {
+		graph.AddSeries(phaseNames[phase], []opts.LineData{})
+	}
+	return graph
+}
+
 type Metrics struct {
 	Values []interface{} `json:"values"`
 	Time   string        `json:"time"`
@@ -237,7 +252,7 @@ type Charts struct {
 	dataFunc func() *ChartsReport
 }
 
-func NewCharts(ln net.Listener, dataFunc func() *ChartsReport, desc string) (*Charts, error) {
+func NewCharts(ln net.Listener, dataFunc func() *ChartsReport, desc string, breakdown bool) (*Charts, error) {
 	templates.PageTpl = fmt.Sprintf(PageTpl, desc)
 
 	c := &Charts{ln: ln, dataFunc: dataFunc}
@@ -246,6 +261,9 @@ func NewCharts(ln net.Listener, dataFunc func() *ChartsReport, desc string) (*Ch
 	c.page.AssetsHost = assetsPath
 	c.page.Assets.JSAssets.Add("jquery.min.js")
 	c.page.AddCharts(c.newLatencyView(), c.newRPSView(), c.newCodeView(), c.newConcurrencyView())
+	if breakdown {
+		c.page.AddCharts(c.newBreakdownView())
+	}
 
 	return c, nil
 }
@@ -282,6 +300,14 @@ func (c *Charts) Handler(ctx *fasthttp.RequestCtx) {
 				values = append(values, reportData.Concurrency)
 			} else {
 				values = append(values, nil)
+			}
+		case breakdownView:
+			for i := range chartPhases {
+				if reportData != nil && i < len(reportData.Breakdown) {
+					values = append(values, reportData.Breakdown[i]/1e6)
+				} else {
+					values = append(values, nil)
+				}
 			}
 		}
 		metrics := &Metrics{

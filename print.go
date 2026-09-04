@@ -204,6 +204,10 @@ func (p *Printer) formatJSONReports(writer *bytes.Buffer, snapshot *SnapshotRepo
 	}
 	writer.WriteString(",\n")
 	p.buildJSONStats(writer, snapshot, useSeconds, indent)
+	if len(snapshot.Breakdown) != 0 {
+		writer.WriteString(",\n")
+		p.buildJSONBreakdown(writer, snapshot, useSeconds, indent)
+	}
 	writer.WriteString(",\n")
 	p.buildJSONPercentile(writer, snapshot, useSeconds, indent)
 	writer.WriteString(",\n")
@@ -230,6 +234,11 @@ func (p *Printer) formatTableReports(writer *bytes.Buffer, snapshot *SnapshotRep
 
 	writeBulkWith(writer, statsBulk, "", "  ", "\n")
 	writer.WriteString("\n")
+
+	if breakdownBulk := p.buildBreakdown(snapshot, useSeconds); breakdownBulk != nil {
+		writeBulkWith(writer, breakdownBulk, "", "  ", "\n")
+		writer.WriteString("\n")
+	}
 
 	writer.WriteString("Latency Percentile:\n")
 	writeBulk(writer, percBulk)
@@ -293,6 +302,60 @@ func (p *Printer) buildHistogram(snapshot *SnapshotReport, useSeconds bool, isFi
 		alignBulk(hisBulk, AlignLeft, AlignRight, AlignLeft)
 	}
 	return hisBulk
+}
+
+func (p *Printer) buildJSONBreakdown(writer *bytes.Buffer, snapshot *SnapshotReport, useSeconds bool, indent int) {
+	tab0 := strings.Repeat("  ", indent)
+	writer.WriteString(tab0 + "\"Breakdown\": {\n")
+	tab1 := strings.Repeat("  ", indent+1)
+	for i, phase := range snapshot.Breakdown {
+		writer.WriteString(fmt.Sprintf(`%s"%s": { "Count": %d, "Mean": "%s"`,
+			tab1, phase.Name, phase.Count, durationToString(phase.Mean, useSeconds)))
+		for j, percentile := range phase.Percentiles {
+			writer.WriteString(fmt.Sprintf(`, "P%s": "%s"`,
+				formatFloat64(phaseQuantiles[j]*100), durationToString(percentile, useSeconds)))
+		}
+		writer.WriteString(fmt.Sprintf(`, "Max": "%s" }`, durationToString(phase.Max, useSeconds)))
+		if i != len(snapshot.Breakdown)-1 {
+			writer.WriteString(",")
+		}
+		writer.WriteString("\n")
+	}
+	writer.WriteString(tab0 + "}")
+}
+
+func (p *Printer) buildBreakdown(snapshot *SnapshotReport, useSeconds bool) [][]string {
+	if len(snapshot.Breakdown) == 0 {
+		return nil
+	}
+	header := []string{"Latency Breakdown", "Count", "Mean"}
+	for _, q := range phaseQuantiles {
+		header = append(header, "P"+formatFloat64(q*100))
+	}
+	header = append(header, "Max")
+
+	breakdownBulk := make([][]string, 0, len(snapshot.Breakdown)+1)
+	breakdownBulk = append(breakdownBulk, header)
+	for _, phase := range snapshot.Breakdown {
+		row := []string{
+			"  " + phase.Name,
+			strconv.FormatInt(phase.Count, 10),
+			durationToString(phase.Mean, useSeconds),
+		}
+		for _, percentile := range phase.Percentiles {
+			row = append(row, durationToString(percentile, useSeconds))
+		}
+		row = append(row, durationToString(phase.Max, useSeconds))
+		breakdownBulk = append(breakdownBulk, row)
+	}
+
+	aligns := make([]int, 0, len(header))
+	aligns = append(aligns, AlignLeft)
+	for i := 1; i < len(header); i++ {
+		aligns = append(aligns, AlignCenter)
+	}
+	alignBulk(breakdownBulk, aligns...)
+	return breakdownBulk
 }
 
 func (p *Printer) buildJSONPercentile(writer *bytes.Buffer, snapshot *SnapshotReport, useSeconds bool, indent int) {
