@@ -133,7 +133,7 @@ Flags:
       --output-errors=OUTPUT-ERRORS  
                                  Output errors to file
       --summary                  Only print the summary without realtime reports
-      --breakdown                Split the latency of each request into connect, tls, write, wait and read phases
+      --breakdown                Split the latency of each request into connect, tls, write, wait and read phases; each worker then keeps its own connection
       --unix-socket=UNIX-SOCKET  Unix domain socket path to use for connection
       --version                  Show application version.
 
@@ -196,7 +196,10 @@ Notes:
 * Phases are only recorded for requests that completed, so failed requests do not distort them.
 * `Read` is `0` when the whole response arrives in a single read, which is the normal case for small responses.
 * The breakdown gives each connection to a single worker so that connection level timings can be attributed to the
-  request that caused them. Total connections are still `-c`, but they are no longer pooled across workers.
+  request that caused them. At full speed this changes nothing - `-c` connections are open either way - but it does
+  when the workers sit idle: without the flag the shared pool settles for as few connections as the load actually
+  needs, and `-c 20 --rate 20` against a local server settles for a single one, while with the flag all 20 stay open.
+  So when combining `--breakdown` with `--rate`, the target sees a connection count it would not see otherwise.
 
 ### Bash/ZSH Shell Completion
 

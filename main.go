@@ -52,7 +52,7 @@ var (
 	clean           = kingpin.Flag("clean", "Clean the histogram bar once its finished. Default is true").Default("true").NegatableBool()
 	outputErrors    = kingpin.Flag("output-errors", "Output errors to file").String()
 	summary         = kingpin.Flag("summary", "Only print the summary without realtime reports").Default("false").Bool()
-	breakdown       = kingpin.Flag("breakdown", "Split the latency of each request into connect, tls, write, wait and read phases").Default("false").Bool()
+	breakdown       = kingpin.Flag("breakdown", "Split the latency of each request into connect, tls, write, wait and read phases; each worker then keeps its own connection").Default("false").Bool()
 	pprofAddr       = kingpin.Flag("pprof", "Enable pprof at special address").Hidden().String()
 	url             = kingpin.Arg("url", "Request url").Required().String()
 	unixSocket      = kingpin.Flag("unix-socket", "Unix domain socket path to use for connection").String()

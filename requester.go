@@ -224,13 +224,18 @@ func NewRequester(concurrency int, requests int64, duration time.Duration, reqRa
 		httpClients: make([]*fasthttp.HostClient, concurrency),
 	}
 	if clientOpt.breakdown {
+		// One dialer for all of them, so they still share a single DNS cache.
+		baseDial, err := buildBaseDialFunc(clientOpt)
+		if err != nil {
+			return nil, err
+		}
 		r.traces = make([]*phaseTrace, concurrency)
 		for i := 0; i < concurrency; i++ {
 			// Own client, own connection, own trace: see phaseTrace.
 			workerOpt := *clientOpt
 			workerOpt.maxConns = 1
 			trace := &phaseTrace{}
-			client, header, err := buildTracedRequestClient(&workerOpt, &r.readBytes, &r.writeBytes, trace)
+			client, header, err := buildTracedRequestClient(&workerOpt, &r.readBytes, &r.writeBytes, trace, baseDial)
 			if err != nil {
 				return nil, err
 			}
@@ -306,11 +311,40 @@ func tlsServerName(addr string) string {
 	return host
 }
 
-func buildRequestClient(opt *ClientOpt, r *int64, w *int64) (*fasthttp.HostClient, *fasthttp.RequestHeader, error) {
-	return buildTracedRequestClient(opt, r, w, nil)
+// buildBaseDialFunc builds the dial func for the configured transport. Dialing
+// holds no per-request state, so one is shared by every worker: a dialer of its
+// own per worker would also mean a DNS cache of its own per worker.
+func buildBaseDialFunc(opt *ClientOpt) (fasthttp.DialFunc, error) {
+	switch {
+	case opt.socks5Proxy != "":
+		proxy := opt.socks5Proxy
+		if !strings.Contains(proxy, "://") {
+			proxy = "socks5://" + proxy
+		}
+		return fasthttpproxy.FasthttpSocksDialer(proxy), nil
+	case opt.unixSocket != "":
+		return func(addr string) (net.Conn, error) {
+			return net.Dial("unix", opt.unixSocket)
+		}, nil
+	case opt.httpProxy != "":
+		return fasthttpproxy.FasthttpHTTPDialerDualStack(opt.httpProxy), nil
+	default:
+		dialer := fasthttpproxy.Dialer{
+			Timeout:        opt.dialTimeout,
+			ConnectTimeout: opt.dialTimeout,
+			DialDualStack:  true,
+		}
+		return dialer.GetDialFunc(true)
+	}
 }
 
-func buildTracedRequestClient(opt *ClientOpt, r *int64, w *int64, trace *phaseTrace) (*fasthttp.HostClient, *fasthttp.RequestHeader, error) {
+func buildRequestClient(opt *ClientOpt, r *int64, w *int64) (*fasthttp.HostClient, *fasthttp.RequestHeader, error) {
+	return buildTracedRequestClient(opt, r, w, nil, nil)
+}
+
+// A nil baseDial makes the client build its own; the workers of a traced run
+// pass a shared one in.
+func buildTracedRequestClient(opt *ClientOpt, r *int64, w *int64, trace *phaseTrace, baseDial fasthttp.DialFunc) (*fasthttp.HostClient, *fasthttp.RequestHeader, error) {
 	u, err := url2.Parse(opt.url)
 	if err != nil {
 		return nil, nil, err
@@ -324,29 +358,13 @@ func buildTracedRequestClient(opt *ClientOpt, r *int64, w *int64, trace *phaseTr
 		WriteTimeout:                  opt.writeTimeout,
 		DisableHeaderNamesNormalizing: true,
 	}
-	if opt.socks5Proxy != "" {
-		if !strings.Contains(opt.socks5Proxy, "://") {
-			opt.socks5Proxy = "socks5://" + opt.socks5Proxy
-		}
-		httpClient.Dial = fasthttpproxy.FasthttpSocksDialer(opt.socks5Proxy)
-	} else if opt.unixSocket != "" {
-		httpClient.Dial = func(addr string) (net.Conn, error) {
-			return net.Dial("unix", opt.unixSocket)
-		}
-	} else if opt.httpProxy != "" {
-		httpClient.Dial = fasthttpproxy.FasthttpHTTPDialerDualStack(opt.httpProxy)
-	} else {
-		dialer := fasthttpproxy.Dialer{
-			Timeout:        opt.dialTimeout,
-			ConnectTimeout: opt.dialTimeout,
-			DialDualStack:  true,
-		}
-		httpClient.Dial, err = dialer.GetDialFunc(true)
+	if baseDial == nil {
+		baseDial, err = buildBaseDialFunc(opt)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
-	httpClient.Dial = ThroughputInterceptorDial(httpClient.Dial, r, w, trace)
+	httpClient.Dial = ThroughputInterceptorDial(baseDial, r, w, trace)
 
 	tlsConfig, err := buildTLSConfig(opt)
 	if err != nil {
